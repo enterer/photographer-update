@@ -1,0 +1,167 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Transform: AWS::Serverless-2016-10-31
+Description: Wedding photo sharing - guests see public photos plus photos they appear in.
+
+Parameters:
+  EventCode:
+    Type: String
+    NoEcho: true
+    Description: Short code printed on invitations/cards. Required before a selfie is accepted.
+  UploadCode:
+    Type: String
+    NoEcho: true
+    Description: Separate code for photographers. Never share it with guests.
+  CollectionId:
+    Type: String
+    Default: wedding-faces
+    Description: Rekognition collection name (created by scripts/upload_photos.py).
+  MatchThreshold:
+    Type: Number
+    Default: 95
+    Description: Minimum face similarity (0-100). Keep high to avoid lookalike matches.
+  AllowedOrigin:
+    Type: String
+    Default: "*"
+    Description: Origin of the hosted guest page, e.g. https://photos.example.com. Tighten after hosting.
+
+Globals:
+  Function:
+    Runtime: python3.12
+    Timeout: 20
+    MemorySize: 512
+    Architectures: [arm64]
+
+Resources:
+  PhotosBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      CorsConfiguration:
+        CorsRules:
+          - AllowedMethods: [GET, POST]
+            AllowedOrigins: [!Ref AllowedOrigin]
+            AllowedHeaders: ["*"]
+            MaxAge: 3600
+
+  SessionsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: sessionId
+          AttributeType: S
+      KeySchema:
+        - AttributeName: sessionId
+          KeyType: HASH
+      TimeToLiveSpecification:
+        AttributeName: expiresAt
+        Enabled: true
+
+  GuestApi:
+    Type: AWS::Serverless::HttpApi
+    Properties:
+      CorsConfiguration:
+        AllowOrigins: [!Ref AllowedOrigin]
+        AllowMethods: [GET, POST, OPTIONS]
+        AllowHeaders: [content-type, authorization]
+        MaxAge: 3600
+      DefaultRouteSettings:
+        ThrottlingBurstLimit: 20
+        ThrottlingRateLimit: 10
+
+  ApiFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: backend/
+      Handler: app.handler
+      Environment:
+        Variables:
+          BUCKET: !Ref PhotosBucket
+          TABLE: !Ref SessionsTable
+          COLLECTION_ID: !Ref CollectionId
+          EVENT_CODE: !Ref EventCode
+          UPLOAD_CODE: !Ref UploadCode
+          MATCH_THRESHOLD: !Ref MatchThreshold
+      Policies:
+        - S3ReadPolicy:
+            BucketName: !Ref PhotosBucket
+        - DynamoDBCrudPolicy:
+            TableName: !Ref SessionsTable
+        - Statement:
+            - Effect: Allow
+              Action: s3:PutObject
+              Resource: !Sub "${PhotosBucket.Arn}/incoming/*"
+            - Effect: Allow
+              Action: rekognition:SearchFacesByImage
+              Resource: !Sub arn:aws:rekognition:${AWS::Region}:${AWS::AccountId}:collection/${CollectionId}
+      Events:
+        Match:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref GuestApi
+            Path: /match
+            Method: POST
+        Gallery:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref GuestApi
+            Path: /gallery
+            Method: GET
+        UploadUrls:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref GuestApi
+            Path: /upload-urls
+            Method: POST
+
+  # Processes every photo that lands in incoming/: resize, index faces, publish.
+  ProcessorFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: processor/
+      Handler: app.handler
+      Timeout: 180
+      MemorySize: 2048
+      Environment:
+        Variables:
+          COLLECTION_ID: !Ref CollectionId
+      Policies:
+        - Statement:
+            # Bucket matched by name pattern rather than !Ref to avoid a circular
+            # dependency between the bucket's notification and this function.
+            - Effect: Allow
+              Action: [s3:GetObject, s3:PutObject, s3:DeleteObject]
+              Resource: !Sub "arn:aws:s3:::${AWS::StackName}-photosbucket-*/*"
+            - Effect: Allow
+              Action: s3:ListBucket
+              Resource: !Sub "arn:aws:s3:::${AWS::StackName}-photosbucket-*"
+            - Effect: Allow
+              Action: [rekognition:IndexFaces, rekognition:CreateCollection]
+              Resource: !Sub arn:aws:rekognition:${AWS::Region}:${AWS::AccountId}:collection/${CollectionId}
+      Events:
+        NewPhoto:
+          Type: S3
+          Properties:
+            Bucket: !Ref PhotosBucket
+            Events: s3:ObjectCreated:*
+            Filter:
+              S3Key:
+                Rules:
+                  - Name: prefix
+                    Value: incoming/
+
+Outputs:
+  ApiUrl:
+    Description: Paste this into frontend/config.js
+    Value: !Sub https://${GuestApi}.execute-api.${AWS::Region}.amazonaws.com
+  BucketName:
+    Description: Use with scripts/upload_photos.py
+    Value: !Ref PhotosBucket
